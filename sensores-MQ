@@ -1,0 +1,254 @@
+#include <Arduino.h>
+
+// Configuração dos pinos (ajuste conforme sua montagem)
+#define MQ135_PIN 34    // MQ-135
+#define MQ4_PIN 35      // MQ-4
+#define MQ7_PIN 32      // MQ-7
+#define RL_VALUE 10000  // Resistor de carga (10KΩ)
+
+// Parâmetros de calibração e curvas dos sensores
+struct MQSensor {
+  String name;
+  int pin;
+  float r0;                // Resistência em ar limpo
+  float a, b;              // Coeficientes da curva: Rs/R0 = a * (conc)^b
+  int heatingTime;         // Tempo de aquecimento em segundos
+  String targetGases[3];   // Gases principais detectados
+};
+
+// Instâncias dos sensores (valores de calibração inicial - ajuste com ar limpo)
+MQSensor mq135 = {"MQ-135", MQ135_PIN, 30.0, 1.5, -0.32, 3600, {"NH3", "CO2", "Benzeno"}};
+MQSensor mq4 = {"MQ-4", MQ4_PIN, 4.5, 10.0, -0.36, 3600, {"Metano", "GNL", "Gás Natural"}};
+MQSensor mq7 = {"MQ-7", MQ7_PIN, 27.0, 99.0, -1.52, 3600, {"CO", "H2", "LPG"}};
+
+// Configurações do sistema
+const int SAMPLES = 50;             // Número de amostras para média
+const int PRE_HEAT_HOURS = 24;      // Tempo recomendado de pré-aquecimento
+const float VREF = 3.3;             // Tensão de referência do ADC (ESP32)
+const float ADC_MAX = 4095.0;       // Resolução do ADC (12 bits)
+
+unsigned long heatStartTime = 0;
+bool isCalibrated = false;
+
+// Buffer circular para média móvel
+class MovingAverage {
+  private:
+    float *buffer;
+    int size;
+    int index = 0;
+    float sum = 0;
+  
+  public:
+    MovingAverage(int len) : size(len) {
+      buffer = new float[size];
+      for (int i = 0; i < size; i++) buffer[i] = 0;
+    }
+    
+    float add(float value) {
+      sum -= buffer[index];
+      buffer[index] = value;
+      sum += value;
+      index = (index + 1) % size;
+      return sum / size;
+    }
+    
+    ~MovingAverage() { delete[] buffer; }
+};
+
+MovingAverage mq135Avg(SAMPLES), mq4Avg(SAMPLES), mq7Avg(SAMPLES);
+
+// Converte tensão lida para resistência do sensor (Rs)
+float readRs(MQSensor &sensor) {
+  int adcValue = analogRead(sensor.pin);
+  float voltage = (adcValue / ADC_MAX) * VREF;
+  
+  // Evita divisão por zero
+  if (voltage <= 0.001) voltage = 0.001;
+  
+  // Rs = (Vc * RL / Vrl) - RL
+  return ((VREF * RL_VALUE) / voltage) - RL_VALUE;
+}
+
+// Calcula concentração em PPM
+float calculatePPM(MQSensor &sensor, float rs) {
+  float ratio = rs / sensor.r0;
+  
+  // Se ratio for muito baixo, assume ar limpo
+  if (ratio <= 0.1) return 0;
+  
+  // Fórmula invertida: conc = (ratio / a) ^ (1/b)
+  return pow(ratio / sensor.a, 1.0 / sensor.b);
+}
+
+// Calibração automática do R0 em ar limpar (executar ao ar livre)
+void calibrateSensors() {
+  Serial.println("\n=== CALIBRANDO SENSORES (ar limpo) ===");
+  Serial.println("Certifique-se de colocar os sensores em ar limpo/puro!");
+  Serial.println("Aguardando 30 segundos para estabilização...\n");
+  
+  delay(30000);
+  
+  // Lê múltiplas amostras para calcular R0 médio
+  float r0_135 = 0, r0_4 = 0, r0_7 = 0;
+  
+  for (int i = 0; i < 500; i++) {
+    r0_135 += readRs(mq135);
+    r0_4 += readRs(mq4);
+    r0_7 += readRs(mq7);
+    delay(10);
+  }
+  
+  mq135.r0 = r0_135 / 500.0;
+  mq4.r0 = r0_4 / 500.0;
+  mq7.r0 = r0_7 / 500.0;
+  
+  Serial.println("Calibração concluída! Valores R0:");
+  Serial.printf("MQ-135 R0: %.2f kΩ\n", mq135.r0 / 1000);
+  Serial.printf("MQ-4   R0: %.2f kΩ\n", mq4.r0 / 1000);
+  Serial.printf("MQ-7   R0: %.2f kΩ\n", mq7.r0 / 1000);
+  Serial.println("Salve esses valores no código para futuras execuções!\n");
+  
+  isCalibrated = true;
+}
+
+// Exibe status completo da composição atmosférica
+void displayAtmosphericComposition() {
+  float rs135 = mq135Avg.add(readRs(mq135));
+  float rs4 = mq4Avg.add(readRs(mq4));
+  float rs7 = mq7Avg.add(readRs(mq7));
+  
+  float ppm135 = calculatePPM(mq135, rs135);
+  float ppm4 = calculatePPM(mq4, rs4);
+  float ppm7 = calculatePPM(mq7, rs7);
+  
+  // Limita valores negativos ou absurdos
+  ppm135 = max(0.0, min(ppm135, 10000.0));
+  ppm4 = max(0.0, min(ppm4, 50000.0));
+  ppm7 = max(0.0, min(ppm7, 10000.0));
+  
+  Serial.println("\n╔════════════════════════════════════════════════════════╗");
+  Serial.println("║      ANÁLISE DA COMPOSIÇÃO ATMOSFÉRICA - ESP32         ║");
+  Serial.println("╠════════════════════════════════════════════════════════╣");
+  
+  // MQ-135 - Qualidade do Ar
+  Serial.printf("║ MQ-135 (Qualidade do Ar)                               ║\n");
+  Serial.printf("║ ├─ Amônia (NH3):      %7.1f ppm                      ║\n", ppm135 * 0.3);
+  Serial.printf("║ ├─ CO2 (estimado):    %7.1f ppm                      ║\n", ppm135 * 2.0);
+  Serial.printf("║ ├─ Benzeno:           %7.1f ppm                      ║\n", ppm135 * 0.1);
+  Serial.printf("║ └─ Status:            %-28s║\n", 
+                (ppm135 > 50 ? "⚠️ Poluição Alta" : (ppm135 > 20 ? "⚠️ Poluição Média" : "✅ Ar Limpo")));
+  
+  // MQ-4 - Gás Natural
+  Serial.printf("║ MQ-4 (Gás Combustível)                                 ║\n");
+  Serial.printf("║ ├─ Metano (CH4):      %7.1f ppm                      ║\n", ppm4);
+  Serial.printf("║ ├─ Gás Natural:       %7.1f ppm                      ║\n", ppm4 * 1.2);
+  Serial.printf("║ └─ Status:            %-28s║\n", 
+                (ppm4 > 1000 ? "🚨 Vazamento Detectado!" : (ppm4 > 500 ? "⚠️ Concentração Alta" : "✅ Seguro")));
+  
+  // MQ-7 - Monóxido de Carbono
+  Serial.printf("║ MQ-7 (CO/H2)                                           ║\n");
+  Serial.printf("║ ├─ Monóxido Carbono:  %7.1f ppm                      ║\n", ppm7);
+  Serial.printf("║ ├─ Hidrogênio:        %7.1f ppm                      ║\n", ppm7 * 0.3);
+  Serial.printf("║ └─ Status:            %-28s║\n", 
+                (ppm7 > 50 ? "🚨 Perigo CO!" : (ppm7 > 10 ? "⚠️ CO Detectado" : "✅ CO Seguro")));
+  
+  // Resumo geral
+  float iqa = calculateAQI(ppm135, ppm4, ppm7);
+  Serial.printf("║                                                        ║\n");
+  Serial.printf("║ Índice Qualidade Ar:  %6.1f/100                      ║\n", iqa);
+  Serial.printf("║ %s                                      ║\n", getAirQualityDescription(iqa));
+  
+  Serial.println("╚════════════════════════════════════════════════════════╝\n");
+}
+
+// Calcula Índice de Qualidade do Ar simplificado
+float calculateAQI(float mq135ppm, float mq4ppm, float mq7ppm) {
+  float score = 100;
+  
+  // Deducts baseado em concentrações (ajustes empíricos)
+  if (mq135ppm > 50) score -= (mq135ppm - 50) * 0.5;
+  if (mq4ppm > 1000) score -= (mq4ppm / 1000.0) * 5;
+  if (mq7ppm > 9) score -= (mq7ppm - 9) * 3;
+  
+  return constrain(score, 0, 100);
+}
+
+// Descrição textual da qualidade do ar
+const char* getAirQualityDescription(float aqi) {
+  if (aqi >= 80) return "║ ✅ EXCELENTE - Ar puro e saudável               ║";
+  if (aqi >= 60) return "║ ✅ BOM - Qualidade satisfatória                 ║";
+  if (aqi >= 40) return "║ ⚠️ MODERADO - Aceitável para maioria            ║";
+  if (aqi >= 20) return "║ ⚠️ RUIM - Sensível ao ar deve limitar exposição ║";
+  return "║ 🚨 PERIGOSO - Evite exposição!                  ║";
+}
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);  // Resolução máxima do ADC ESP32
+  
+  Serial.println("\n═══════════════════════════════════════════════════════");
+  Serial.println("   SISTEMA DE MONITORAMENTO ATMOSFÉRICO - ESP32");
+  Serial.println("═══════════════════════════════════════════════════════");
+  Serial.println("Sensores: MQ-135, MQ-4, MQ-7");
+  Serial.println("\n⚠️  IMPORTANTE:");
+  Serial.println("   - Sensor precisa de pré-aquecimento de 24h");
+  Serial.println("   - Execute calibração ao ar livre na primeira vez");
+  Serial.println("   - Digite 'calibrar' para iniciar calibração");
+  Serial.println("   - Digite 'status' para ver status detalhado\n");
+  
+  // Inicia aquecimento
+  heatStartTime = millis();
+}
+
+void loop() {
+  // Verifica comandos seriais
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+    
+    if (command == "calibrar") {
+      calibrateSensors();
+    } else if (command == "status") {
+      showDetailedStatus();
+    }
+  }
+  
+  // Exibe leituras a cada 2 segundos
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 2000) {
+    lastPrint = millis();
+    
+    // Calcula tempo de aquecimento
+    int hours = (millis() - heatStartTime) / 3600000;
+    int minutes = ((millis() - heatStartTime) % 3600000) / 60000;
+    
+    Serial.printf("⏱️  Tempo Aquecimento: %02d:%02d | ", hours, minutes);
+    
+    if (hours < PRE_HEAT_HOURS) {
+      Serial.printf("⚠️  Aquecendo... (%d%%)\n", (hours * 100) / PRE_HEAT_HOURS);
+    } else if (!isCalibrated) {
+      Serial.println("✅ Pronto! Execute 'calibrar' ao ar livre");
+    } else {
+      displayAtmosphericComposition();
+    }
+  }
+  
+  delay(100); // Pequena pausa para estabilidade
+}
+
+// Mostra status técnico detalhado
+void showDetailedStatus() {
+  Serial.println("\n=== STATUS TÉCNICO DETALHADO ===");
+  float rs135 = readRs(mq135);
+  float rs4 = readRs(mq4);
+  float rs7 = readRs(mq7);
+  
+  Serial.printf("MQ-135 - Rs: %.2f kΩ | R0: %.2f kΩ | Ratio: %.3f\n", 
+                rs135/1000, mq135.r0/1000, rs135/mq135.r0);
+  Serial.printf("MQ-4   - Rs: %.2f kΩ | R0: %.2f kΩ | Ratio: %.3f\n", 
+                rs4/1000, mq4.r0/1000, rs4/mq4.r0);
+  Serial.printf("MQ-7   - Rs: %.2f kΩ | R0: %.2f kΩ | Ratio: %.3f\n", 
+                rs7/1000, mq7.r0/1000, rs7/mq7.r0);
+  Serial.println("=================================\n");
+}
