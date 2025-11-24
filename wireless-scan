@@ -1,0 +1,182 @@
+#include <WiFi.h>
+
+String selectedSSID = "";
+String password = "";
+bool shouldConnect = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== Scanner Wi-Fi ESP32 ===");
+  Serial.println("Iniciando escaneamento...\n");
+  
+  // Modo STA para escanear redes
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  
+  // Escaneia redes disponíveis
+  scanNetworks();
+  
+  // Pergunta ao usuário qual rede conectar
+  askForSSID();
+}
+
+void loop() {
+  // Tenta conectar quando solicitado
+  if (shouldConnect) {
+    connectToWiFi();
+    shouldConnect = false;
+  }
+  
+  // Comando para re-escanear redes
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command.equalsIgnoreCase("rescan")) {
+      Serial.println("\n=== Re-escaneando redes ===");
+      scanNetworks();
+      askForSSID();
+    }
+  }
+}
+
+// Escaneia e lista todas as redes Wi-Fi próximas
+void scanNetworks() {
+  Serial.println("Escaneando redes Wi-Fi...");
+  
+  // Limpa resultados anteriores
+  WiFi.scanDelete();
+  
+  // Escaneia redes (true = redes ocultas também)
+  int n = WiFi.scanNetworks(false, true);
+  
+  if (n == 0) {
+    Serial.println("Nenhuma rede encontrada!");
+    return;
+  }
+  
+  Serial.println("\nRedes encontradas:");
+  Serial.println("Nº | SSID                         | RSSI  | Canal | Segurança");
+  Serial.println("---|------------------------------|-------|-------|------------------");
+  
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    int rssi = WiFi.RSSI(i);
+    int channel = WiFi.channel(i);
+    String encryption = encryptionTypeToString(WiFi.encryptionType(i));
+    
+    // Trata SSID vazio (rede oculta)
+    if (ssid.length() == 0) {
+      ssid = "<Oculto>";
+    }
+    
+    // Formata e exibe informações
+    Serial.printf("%2d | %-28s | %5d | %5d | %s\n", 
+                  i + 1, ssid.c_str(), rssi, channel, encryption.c_str());
+  }
+  
+  Serial.println("\nDigite o NÚMERO da rede ou o NOME do SSID para conectar:");
+}
+
+// Solicita ao usuário o SSID e a senha
+void askForSSID() {
+  // Aguarda input do usuário
+  while (!Serial.available()) {
+    delay(100);
+  }
+  
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+  
+  // Verifica se digitou número ou nome do SSID
+  int networkIndex = input.toInt() - 1;
+  int totalNetworks = WiFi.scanNetworks();
+  
+  if (networkIndex >= 0 && networkIndex < totalNetworks) {
+    // Selecionou pelo número
+    selectedSSID = WiFi.SSID(networkIndex);
+  } else {
+    // Digitou o nome do SSID diretamente
+    selectedSSID = input;
+  }
+  
+  Serial.print("\nSSID selecionado: ");
+  Serial.println(selectedSSID);
+  Serial.println("Digite a senha da rede:");
+  
+  // Aguarda a senha
+  while (!Serial.available()) {
+    delay(100);
+  }
+  
+  password = Serial.readStringUntil('\n');
+  password.trim();
+  
+  Serial.println("Senha recebida. Tentando conectar...\n");
+  shouldConnect = true;
+}
+
+// Conecta à rede Wi-Fi selecionada
+void connectToWiFi() {
+  // Desconecta se já estiver conectado
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect();
+    delay(1000);
+  }
+  
+  // Inicia conexão
+  WiFi.begin(selectedSSID.c_str(), password.c_str());
+  
+  Serial.print("Conectando");
+  
+  // Aguarda conexão (timeout de 10 segundos)
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  Serial.println();
+  
+  // Verifica resultado
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ CONECTADO COM SUCESSO!");
+    Serial.println("--------------------------------");
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Máscara: ");
+    Serial.println(WiFi.subnetMask());
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("MAC: ");
+    Serial.println(WiFi.macAddress());
+    Serial.println("--------------------------------");
+    Serial.println("\nDigite 'rescan' para procurar redes novamente.");
+  } else {
+    Serial.println("❌ FALHA NA CONEXÃO!");
+    Serial.println("Verifique o SSID e a senha digitados.");
+    Serial.println("\nDigite 'rescan' para tentar novamente.");
+  }
+}
+
+// Converte tipo de criptografia para string legível
+String encryptionTypeToString(wifi_auth_mode_t encryptionType) {
+  switch (encryptionType) {
+    case WIFI_AUTH_OPEN: return "Aberta";
+    case WIFI_AUTH_WEP: return "WEP";
+    case WIFI_AUTH_WPA_PSK: return "WPA";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2 Ent.";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+    case WIFI_AUTH_WAPI_PSK: return "WAPI";
+    default: return "Desconhecido";
+  }
+}
