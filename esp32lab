@@ -1,0 +1,395 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ===============================
+// CONFIGURAÇÕES FIXAS (alterar aqui)
+// ===============================
+#define DEVICE_ID "esp32_sensor_01"
+#define LOCATION "lab_01"
+
+// Pinos ADC
+#define MQ4_PIN 32
+#define MQ7_PIN 33
+#define MQ135_PIN 34
+#define YL69_PIN 35
+
+// Sensores adicionais
+#define DHT_PIN 4
+#define DS18B20_PIN 15
+
+// Configurações de leitura
+#define ADC_RES 4095.0
+#define ADC_VOLT 3.3
+#define RL_MQ 20000.0
+#define PUBLISH_INTERVAL 5000
+#define STATUS_INTERVAL 30000
+#define WIFI_RECONNECT_MS 10000
+#define MQTT_RECONNECT_MS 5000
+#define WEB_PORT 80
+
+// ===============================
+// Objetos globais
+// ===============================
+DHT dht(DHT_PIN, DHT22);
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+WebServer server(WEB_PORT);
+Preferences prefs;
+
+struct Config {
+  char wifiSSID[64] = "IoTLAN";      // default
+  char wifiPass[64] = "esp32IoT";     // default
+  char mqttServer[64] = "10.10.10.30";
+  int mqttPort = 1883;
+  char mqttUser[64] = "";
+  char mqttPass[64] = "";
+  char mqttClientId[32] = DEVICE_ID;
+  bool sensorsEnabled[6] = {true, true, true, true, true, true}; // enable all
+  float mq4Ro = 10000;
+  float mq7Ro = 10000;
+  float mq135Ro = 10000;
+  int yl69Dry = 2700;
+  int yl69Wet = 1000;
+} config;
+
+unsigned long lastPub = 0, lastStatus = 0, lastMqtt = 0, lastWifi = 0;
+uint32_t msgCount = 0;
+bool wifiConnected = false, mqttConnected = false;
+
+// ===============================
+// Funções auxiliares
+// ===============================
+void loadConfig() {
+  prefs.begin("sensorhub", false);
+  prefs.getString("wifiSSID", config.wifiSSID, 64);
+  prefs.getString("wifiPass", config.wifiPass, 64);
+  prefs.getString("mqttServer", config.mqttServer, 64);
+  config.mqttPort = prefs.getInt("mqttPort", 1883);
+  prefs.getString("mqttUser", config.mqttUser, 64);
+  prefs.getString("mqttPass", config.mqttPass, 64);
+  prefs.getString("mqttClientId", config.mqttClientId, 32);
+  for (int i=0;i<6;i++) {
+    config.sensorsEnabled[i] = prefs.getBool(("sensor"+String(i)).c_str(), true);
+  }
+  config.mq4Ro = prefs.getFloat("mq4Ro", 10000);
+  config.mq7Ro = prefs.getFloat("mq7Ro", 10000);
+  config.mq135Ro = prefs.getFloat("mq135Ro", 10000);
+  config.yl69Dry = prefs.getInt("yl69Dry", 2700);
+  config.yl69Wet = prefs.getInt("yl69Wet", 1000);
+  prefs.end();
+}
+void saveConfig() {
+  prefs.begin("sensorhub", false);
+  prefs.putString("wifiSSID", config.wifiSSID);
+  prefs.putString("wifiPass", config.wifiPass);
+  prefs.putString("mqttServer", config.mqttServer);
+  prefs.putInt("mqttPort", config.mqttPort);
+  prefs.putString("mqttUser", config.mqttUser);
+  prefs.putString("mqttPass", config.mqttPass);
+  prefs.putString("mqttClientId", config.mqttClientId);
+  for (int i=0;i<6;i++) {
+    prefs.putBool(("sensor"+String(i)).c_str(), config.sensorsEnabled[i]);
+  }
+  prefs.putFloat("mq4Ro", config.mq4Ro);
+  prefs.putFloat("mq7Ro", config.mq7Ro);
+  prefs.putFloat("mq135Ro", config.mq135Ro);
+  prefs.putInt("yl69Dry", config.yl69Dry);
+  prefs.putInt("yl69Wet", config.yl69Wet);
+  prefs.end();
+}
+
+// ===============================
+// WiFi
+// ===============================
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  Serial.printf("Conectando ao WiFi: %s\n", config.wifiSSID);
+  WiFi.begin(config.wifiSSID, config.wifiPass);
+}
+void checkWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnected) {
+      wifiConnected = true;
+      Serial.printf("WiFi conectado: %s, IP: %s, RSSI: %d dBm\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
+    return;
+  }
+  if (millis() - lastWifi > WIFI_RECONNECT_MS) {
+    lastWifi = millis();
+    Serial.println("Reconectando WiFi...");
+    WiFi.reconnect();
+  }
+}
+
+// ===============================
+// WebServer
+// ===============================
+void handleRoot() {
+  String html = "<html><head><title>ESP32 Hub</title></head><body><h1>ESP32 Sensor Hub</h1>";
+  html += "<p>Device: " + String(DEVICE_ID) + "</p>";
+  html += "<p><a href=\"/status\">Status JSON</a></p>";
+  html += "<h2>Configuração</h2>"
+          "<form action=\"/save\" method=\"post\">"
+          "SSID: <input name=\"wifiSSID\" value=\"" + String(config.wifiSSID) + "\"><br>"
+          "Senha: <input name=\"wifiPass\" value=\"" + String(config.wifiPass) + "\"><br>"
+          "MQTT Server: <input name=\"mqttServer\" value=\"" + String(config.mqttServer) + "\"><br>"
+          "MQTT Porta: <input name=\"mqttPort\" type=\"number\" value=\"" + String(config.mqttPort) + "\"><br>"
+          "<input type=\"submit\" value=\"Salvar\"></form>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+void handleStatus() {
+  StaticJsonDocument<256> doc;
+  doc["device"] = DEVICE_ID;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["rssi"] = WiFi.RSSI();
+  doc["uptime_s"] = millis()/1000;
+  doc["msg_cnt"] = msgCount;
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+void handleSave() {
+  if (server.hasArg("wifiSSID")) {
+    server.arg("wifiSSID").toCharArray(config.wifiSSID,64);
+  }
+  if (server.hasArg("wifiPass")) {
+    server.arg("wifiPass").toCharArray(config.wifiPass,64);
+  }
+  if (server.hasArg("mqttServer")) {
+    server.arg("mqttServer").toCharArray(config.mqttServer,64);
+  }
+  if (server.hasArg("mqttPort")) {
+    config.mqttPort = server.arg("mqttPort").toInt();
+  }
+  saveConfig();
+  server.send(200, "text/plain", "Configurações salvas. Reinicie o ESP");
+}
+void setupWeb() {
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+  Serial.println("WebServer iniciado");
+}
+void handleWeb() {
+  server.handleClient();
+}
+
+// ===============================
+// MQTT
+// ===============================
+void setupMQTT() {
+  mqttClient.setServer(config.mqttServer, config.mqttPort);
+  mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
+    String msg;
+    for (unsigned int i=0; i<length; i++) msg += (char)payload[i];
+    Serial.printf("MQTT [%s]: %s\n", topic, msg.c_str());
+    if (String(topic) == "sensors/esp32_sensor_01/control") {
+      if (msg == "restart") ESP.restart();
+      if (msg == "status") publishStatus();
+    }
+  });
+}
+void reconnectMQTT() {
+  Serial.println("Reconectando MQTT...");
+  if (mqttClient.connect(config.mqttClientId, config.mqttUser, config.mqttPass, "sensors/esp32_sensor_01/status", 1, true, "offline")) {
+    Serial.println("MQTT conectado");
+    mqttClient.subscribe("sensors/esp32_sensor_01/control");
+    publishStatus();
+  } else {
+    Serial.printf("Erro MQTT: %d\n", mqttClient.state());
+  }
+}
+void checkMQTT() {
+  if (mqttClient.connected()) {
+    mqttConnected=true;
+    mqttClient.loop();
+    return;
+  }
+  if (millis() - lastMqtt > MQTT_RECONNECT_MS) {
+    lastMqtt = millis();
+    reconnectMQTT();
+  }
+}
+
+// ===============================
+// Leitura sensores
+// ===============================
+float readMQSensor(int pin) {
+  long sum=0;
+  for (int i=0; i<10; i++) {
+    sum+=analogRead(pin);
+    delay(1);
+  }
+  return sum/10.0;
+}
+int readYl69() {
+  long sum=0;
+  for (int i=0; i<10; i++) {
+    sum+=analogRead(YL69_PIN);
+    delay(1);
+  }
+  return sum/10;
+}
+float calcPPM(float rs, float ro, float a, float b) {
+  return a * pow(rs/ro, b);
+}
+void readSensors(float* readings) {
+  // 0: DHT22 T
+  // 1: DHT22 H
+  // 2: DS18B20 T
+  // 3: MQ4 ppm
+  // 4: MQ7 ppm
+  // 5: MQ135 ppm
+  // 6: YL-69 %
+  if (config.sensorsEnabled[0]) {
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t)) readings[0]=t; else readings[0]=NAN;
+    if (!isnan(h)) readings[1]=h; else readings[1]=NAN;
+  }
+  if (config.sensorsEnabled[1]) {
+    ds18b20.requestTemperatures();
+    float t2 = ds18b20.getTempCByIndex(0);
+    if (t2 != DEVICE_DISCONNECTED_C) readings[2]=t2; else readings[2]=NAN;
+  }
+  if (config.sensorsEnabled[2]) {
+    float raw=readMQSensor(MQ4_PIN);
+    float v = raw*ADC_VOLT/ADC_RES;
+    float rs = (ADC_VOLT*RL_MQ/v) - RL_MQ;
+    readings[3]=calcPPM(rs, config.mq4Ro, 1000.0,-2.5);
+  }
+  if (config.sensorsEnabled[3]) {
+    float raw=readMQSensor(MQ7_PIN);
+    float v = raw*ADC_VOLT/ADC_RES;
+    float rs = (ADC_VOLT*RL_MQ/v) - RL_MQ;
+    readings[4]=calcPPM(rs, config.mq7Ro, 100.0,-2.0);
+  }
+  if (config.sensorsEnabled[4]) {
+    float raw=readMQSensor(MQ135_PIN);
+    float v = raw*ADC_VOLT/ADC_RES;
+    float rs = (ADC_VOLT*RL_MQ/v) - RL_MQ;
+    readings[5]=calcPPM(rs, config.mq135Ro, 200.0,-2.5);
+  }
+  if (config.sensorsEnabled[5]) {
+    int raw=readYl69();
+    float pct = map(constrain(raw, config.yl69Dry, config.yl69Wet),
+      config.yl69Dry, config.yl69Wet, 0, 100);
+    readings[6]=constrain(pct,0,100);
+  }
+}
+
+// ===============================
+// Publicar dados
+// ===============================
+void publishSensorData() {
+  float readings[7];
+  for (int i=0; i<7; i++) readings[i]=NAN;
+  readSensors(readings);
+  StaticJsonDocument<640> doc;
+  doc["device"]=DEVICE_ID;
+  doc["location"]=LOCATION;
+  doc["timestamp"]=millis()/1000;
+  doc["firmware_version"]=FIRMWARE_VERSION;
+  if (config.sensorsEnabled[0] && !isnan(readings[0])) {
+    doc["temp_dht22_c"] = round(readings[0]*100)/100;
+  }
+  if (config.sensorsEnabled[0] && !isnan(readings[1])) {
+    doc["hum_dht22"] = round(readings[1]*100)/100;
+  }
+  if (config.sensorsEnabled[1] && !isnan(readings[2])) {
+    doc["temp_ds18b20_c"] = round(readings[2]*100)/100;
+  }
+  if (config.sensorsEnabled[2] && !isnan(readings[3])) {
+    doc["ppm_mq4"] = round(readings[3]*10)/10;
+  }
+  if (config.sensorsEnabled[3] && !isnan(readings[4])) {
+    doc["ppm_mq7"] = round(readings[4]*10)/10;
+  }
+  if (config.sensorsEnabled[4] && !isnan(readings[5])) {
+    doc["ppm_mq135"] = round(readings[5]*10)/10;
+  }
+  if (config.sensorsEnabled[5]) {
+    doc["soil_moisture"] = round(readings[6]*10)/10;
+  }
+  doc["rssi"] = WiFi.RSSI();
+  msgCount++;
+  doc["msg_cnt"] = msgCount;
+  char buffer[700];
+  serializeJson(doc, buffer);
+  String topic = "sensors/" + String(DEVICE_ID) + "/data";
+  if (mqttClient.publish(topic.c_str(), buffer)) {
+    Serial.printf("Publicado: %s\n", buffer);
+  } else {
+    Serial.println("Erro ao publicar");
+  }
+}
+// ===============================
+// Status JSON
+// ===============================
+void publishStatus() {
+  StaticJsonDocument<256> doc;
+  doc["device"]=DEVICE_ID;
+  doc["status"]="online";
+  doc["ip"]=WiFi.localIP().toString();
+  doc["rssi"]=WiFi.RSSI();
+  doc["uptime_s"]=millis()/1000;
+  doc["msg_cnt"]=msgCount;
+  String out;
+  serializeJson(doc, out);
+  mqttClient.publish(("sensors/"+String(DEVICE_ID)+"/status").c_str(), out.c_str(), true);
+}
+
+// ===============================
+// Setup geral
+// ===============================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println("Iniciando...");
+  loadConfig();
+  // Conecta WiFi
+  connectWiFi();
+  // Inicializa sensores
+  dht.begin();
+  ds18b20.begin();
+  // Web server
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+  // MQTT
+  setupMQTT();
+}
+
+// ===============================
+// Loop principal
+// ===============================
+void loop() {
+  checkWiFi();
+  if (WiFi.status() != WL_CONNECTED) return;
+  server.handleClient();
+  checkMQTT();
+  if (!mqttClient.connected()) return;
+  unsigned long now=millis();
+  if (now - lastPub >= PUBLISH_INTERVAL) {
+    publishSensorData();
+    lastPub=now;
+  }
+  if (millis() - lastStatus >= STATUS_INTERVAL) {
+    publishStatus();
+    lastStatus=millis();
+  }
+}
